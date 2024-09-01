@@ -1,59 +1,101 @@
-name: Backup Fork
+name: Backup Fork and Sync
 
 on:
   schedule:
-    - cron: '0 0 * * 0'  # 每週日午夜運行一次
+    - cron: '0 0 * * 0'  # 每週日午夜執行
   workflow_dispatch:  # 允許手動觸發
 
+env:
+  UPSTREAM_REPO: ${{ vars.UPSTREAM_REPO || 'https://github.com/iperov/DeepFaceLive.git' }}
+  MAIN_BRANCH: ${{ vars.MAIN_BRANCH || 'master' }}
+
 jobs:
-  backup:
+  backup-and-sync:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # 獲取所有歷史記錄和標籤
-
-      - name: List all branches
-        id: list_branches
-        run: |
-          git fetch --all
-          git branch -r | grep -v '\->' | grep 'upstream/' | sed 's/upstream\///' > branches.txt
-          echo "branches=$(cat branches.txt | tr '\n' ' ')" >> $GITHUB_OUTPUT
-
-      - name: Add upstream repository
-        run: |
-          git remote add upstream https://github.com/iperov/DeepFaceLive.git
-          git fetch upstream
-
-      - name: Backup each branch
-        run: |
-          for branch in $(echo "${{ steps.list_branches.outputs.branches }}"); do
-            git checkout $branch || git checkout -b $branch upstream/$branch
-            git merge upstream/$branch || echo "No changes to merge or merge conflict"
-            git push --tags backup $branch || echo "Failed to push $branch to backup repository"
-          done
-        env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          fetch-depth: 0
+          token: ${{ secrets.PAT_TOKEN }}
 
       - name: Configure Git
         run: |
-          git config --global user.name 'github-actions'
-          git config --global user.email 'github-actions@github.com'
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
 
-      - name: Create version tag
+      - name: Tag current state
         run: |
           TIMESTAMP=$(date +"%Y%m%d%H%M%S")
-          git tag -a "backup-$TIMESTAMP" -m "Backup on $TIMESTAMP"
+          git tag -a "pre-sync-$TIMESTAMP" -m "Pre-sync state on $TIMESTAMP"
+          git push origin "pre-sync-$TIMESTAMP"
 
-      - name: Push changes and tags to backup
-        env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+      - name: Add upstream repository
         run: |
-          git remote add backup https://$GH_TOKEN@github.com/LostSunset/DeepFaceLive.git
-          git push backup --tags || echo "Failed to push tags to backup repository"
+          git remote add upstream ${{ env.UPSTREAM_REPO }} || git remote set-url upstream ${{ env.UPSTREAM_REPO }}
+          git fetch --all --tags
 
-      - name: Check for errors
-        if: failure()
+      - name: Sync and handle conflicts
         run: |
-          echo "Workflow failed. Please check the logs for more information."
+          branches=$(git branch -r | grep 'origin/' | grep -v 'origin/HEAD' | sed 's/origin\///')
+          
+          for branch in $branches; do
+            echo "Processing branch: $branch"
+            
+            if git ls-remote --exit-code --heads upstream $branch > /dev/null 2>&1; then
+              git checkout -B $branch origin/$branch
+              
+              echo "Changes in upstream $branch:"
+              git log --oneline $branch..upstream/$branch
+              
+              if git merge upstream/$branch --no-edit --allow-unrelated-histories; then
+                echo "Successfully merged changes for $branch"
+              else
+                echo "Merge conflict in $branch. Creating a new branch with upstream changes."
+                git merge --abort
+                conflict_branch="${branch}-upstream-changes"
+                git checkout -b $conflict_branch upstream/$branch
+                echo "Created new branch $conflict_branch with upstream changes"
+                git push origin $conflict_branch
+                echo "Please manually review and merge changes from $conflict_branch into $branch"
+                git checkout $branch
+              fi
+              git push origin $branch || echo "Failed to push $branch, please check and push manually if needed"
+            else
+              echo "Branch $branch does not exist in upstream. Skipping."
+            fi
+          done
+
+      - name: Create post-sync version tag
+        run: |
+          TIMESTAMP=$(date +"%Y%m%d%H%M%S")
+          git tag -a "post-sync-$TIMESTAMP" -m "Post-sync state on $TIMESTAMP"
+          git push origin "post-sync-$TIMESTAMP"
+
+      - name: Generate sync report
+        if: always()
+        run: |
+          echo "Sync Report" > sync_report.md
+          echo "===========" >> sync_report.md
+          echo "" >> sync_report.md
+          git branch -r | grep 'origin/' | grep -v 'origin/HEAD' | sed 's/origin\///' | while read branch; do
+            echo "## Branch: $branch" >> sync_report.md
+            if git log HEAD..origin/$branch --oneline | grep -q .; then
+              echo "Status: Changes synced" >> sync_report.md
+              echo "Changes:" >> sync_report.md
+              git log HEAD..origin/$branch --oneline >> sync_report.md
+            else
+              echo "Status: No changes or sync failed" >> sync_report.md
+            fi
+            echo "" >> sync_report.md
+          done
+
+      - name: Upload sync report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sync-report
+          path: sync_report.md
